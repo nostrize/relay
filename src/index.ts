@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
-import { verifyEvent, type Event } from "nostr-tools/pure";
-import { kinds } from "nostr-tools";
+import { verifyEvent } from "nostr-tools/pure";
+import { kinds, nip19, type Filter } from "nostr-tools";
 import { decode as decodeBolt11 } from 'bolt11';
 
 import { isOneOf, isValidTimestamp, not, parseTag } from "./utils";
@@ -10,6 +10,18 @@ import { getSubscriptionMaps, safeInsert, safeTraverse } from "./websockets";
 const boostMaps = getSubscriptionMaps();
 const receiptMaps = getSubscriptionMaps();
 const db = getDb();
+
+if (!process.env.NOSTRIZE_PUBKEY) {
+  throw new Error("NOSTRIZE_PUBKEY is missing");
+}
+
+const { data, type } = nip19.decode(process.env.NOSTRIZE_PUBKEY);
+
+if (type !== "npub") {
+  throw new Error("NOSTRIZE_PUBKEY must be an npub");
+}
+
+const nostrizePubkey = data;
 
 const server = Bun.serve({
   fetch(req, server) {
@@ -86,40 +98,39 @@ function handleNewSubscriber({ ws, params }: any) {
   // a new subsciption
   const [subscriptionId, ...filters] = params;
 
-  if (filters.length > 1) {
-    ws.send(JSON.stringify(["NOTICE", "we don't support multiple filters"]));
+  if (filters.length !== 1) {
+    ws.send(JSON.stringify(["NOTICE", "one filter object is required"]));
     ws.close();
 
     return;
   }
 
-  const filter = filters[0];
+  const filter: Filter = filters[0];
 
   // kinds
-  const isFilterKindSupported = filter.kinds.every((k: number) =>
-    isOneOf(k, [kinds.ShortTextNote, kinds.Zap]),
-  );
-  const isFilterKindOk = filter.kinds.length === 1 && isFilterKindSupported;
+  const isFilterKindSupported = filter.kinds 
+    && filter.kinds.length === 1 
+    && isOneOf(filter.kinds[0], [kinds.ShortTextNote, kinds.Zap]);
 
-  if (!isFilterKindOk) {
+  if (!isFilterKindSupported) {
     ws.send(JSON.stringify(["NOTICE", "we don't support this filter kinds"]));
     ws.close();
 
     return;
   }
 
-  const kind: number = filter.kinds[0];
+  const kind: number = filter.kinds![0];
 
   // authors
   const isAuthorNostrize =
-    filter.authors.length === 1 &&
-    filter.authors[0] === process.env.NOSTRIZE_PUBKEY;
+    filter.authors && filter.authors.length === 1 &&
+    filter.authors[0] === nostrizePubkey;
 
   if (!isAuthorNostrize) {
     ws.send(
       JSON.stringify([
         "NOTICE",
-        "we don't support subscriptions other than nostrize pubkey",
+        "we don't support filter authors other than nostrize pubkey",
       ]),
     );
     ws.close();
@@ -134,11 +145,11 @@ function handleNewSubscriber({ ws, params }: any) {
     
     let query = "SELECT json FROM boosts WHERE 1 = 1";
 
-    if (filter["from"]) {
+    if (filter["#from"]) {
       query += " AND from = $from";
     }
 
-    if (filter["to"]) {
+    if (filter["#to"]) {
       query += " AND to = $to";
     }
 
@@ -155,9 +166,9 @@ function handleNewSubscriber({ ws, params }: any) {
     }
 
     rows = db.query(query).all({ 
-      $author: process.env.NOSTRIZE_PUBKEY, 
-      $from: filter["from"], 
-      $to: filter["to"], 
+      $author: nostrizePubkey, 
+      $from: filter["#from"], 
+      $to: filter["#to"], 
       $since: filter.since,
       $until: filter.until,
     } as any);
@@ -216,8 +227,8 @@ function handleNewEvent({ ws, params }: any) {
     return;
   }
 
-  if (pubkey !== process.env.NOSTRIZE_PUBKEY) {
-    ws.send(JSON.stringify(["NOTICE", "we don't support events with pubkey other than nostrize"]));
+  if (pubkey !== nostrizePubkey) {
+    ws.send(JSON.stringify(["NOTICE", "we don't support events with pubkey other than nostrize's"]));
     ws.close();
 
     return;
